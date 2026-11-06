@@ -1,0 +1,21 @@
+node_modules/
+
+# Settings and runtime state live outside the repo (~/.config/notion-listen and
+# ~/.local/state/notion-listen). These cover files from older versions that
+# kept them here.
+.env
+*.log
+*.sock
+current-page
+orientation-*.md
+mcp.json
+mcp-multi.json
+
+# Written into project folders by the CLI
+.mcp.json
+.mcp.json.bak
+
+# Local tooling
+.claude/settings.local.json
+.boost/
+.DS_Store

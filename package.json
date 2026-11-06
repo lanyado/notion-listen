@@ -1,0 +1,57 @@
+{
+  "name": "notion-listen",
+  "version": "1.0.0",
+  "description": "Comment on a Notion page, and a Claude Code agent does what you asked: edits the page or your files, then replies in the thread.",
+  "keywords": [
+    "notion",
+    "claude",
+    "claude-code",
+    "ai-agent",
+    "mcp",
+    "webhooks",
+    "cli"
+  ],
+  "homepage": "https://github.com/lanyado/notion-listen#readme",
+  "bugs": {
+    "url": "https://github.com/lanyado/notion-listen/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lanyado/notion-listen.git"
+  },
+  "license": "MIT",
+  "author": "Rotem Lanyado",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "notion-listen": "bin/notion-listen"
+  },
+  "files": [
+    "bin",
+    "src",
+    "config",
+    "prompts",
+    "install.sh"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "os": [
+    "darwin",
+    "linux"
+  ],
+  "scripts": {
+    "setup": "tsx src/setup.ts",
+    "test": "tsx test/model-routing.test.ts && tsx test/prompts.test.ts && tsx test/authors.test.ts && tsx test/router.test.ts && bash test/cli.test.sh",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm test"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "tsx": "^4.22.4"
+  },
+  "devDependencies": {
+    "@types/node": "^20.19.43",
+    "typescript": "^5.9.3"
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "enabledMcpjsonServers": [
+    "notion-channel",
+    "notion"
+  ],
+  "permissions": {
+    "defaultMode": "acceptEdits",
+    "allow": [
+      "Task",
+      "mcp__notion__notion-fetch",
+      "mcp__notion__notion-get-comments",
+      "mcp__notion__notion-update-page",
+      "mcp__notion__notion-create-comment",
+      "mcp__notion-channel__reply_to_comment",
+      "mcp__notion-channel__next_comment",
+      "mcp__notion-channel__get_anchor_context",
+      "mcp__notion-channel__react_to_comment"
+    ]
+  }
+}

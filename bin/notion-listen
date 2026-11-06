@@ -1,0 +1,387 @@
+#!/usr/bin/env bash
+# notion-listen: comment on a Notion page, and a Claude Code agent does it.
+# Run `notion-listen help` for usage.
+set -u
+
+# Resolve symlinks (installer link, npm link) so ROOT is always the install.
+# By hand rather than readlink -f, which older macOS lacks.
+self="${BASH_SOURCE[0]}"
+while [ -L "$self" ]; do
+  dir="$(cd -P "$(dirname "$self")" && pwd)"
+  self="$(readlink "$self")"
+  case "$self" in /*) ;; *) self="$dir/$self" ;; esac
+done
+ROOT="$(cd -P "$(dirname "$self")/.." && pwd)"
+unset self dir
+TSX="$ROOT/node_modules/.bin/tsx"
+VERSION="$(sed -n 's/^  "version": "\(.*\)",$/\1/p' "$ROOT/package.json")"
+
+# Settings and runtime state live outside the install, so updates never touch
+# them. src/lib.ts computes the same paths - keep the two in sync.
+CONFIG_DIR="${NOTION_LISTEN_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/notion-listen}"
+STATE_DIR="${NOTION_LISTEN_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/notion-listen}"
+CONFIG_FILE="$CONFIG_DIR/config.env"
+
+# A file with the same name in the config folder overrides the bundled one, so
+# customizations survive updates. src/lib.ts resolves prompts the same way.
+user_or_bundled() { # $1 = path relative to the install
+  local own; own="$CONFIG_DIR/$(basename "$1")"
+  if [ -f "$own" ]; then echo "$own"; else echo "$ROOT/$1"; fi
+}
+
+# --- output -------------------------------------------------------------------
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  B=$'\033[1m' D=$'\033[2m' R=$'\033[31m' G=$'\033[32m' Y=$'\033[33m' X=$'\033[0m'
+else
+  B="" D="" R="" G="" Y="" X=""
+fi
+say()  { echo "$*"; }
+ok()   { echo "  ${G}✔${X} $*"; }
+warn() { echo "  ${Y}!${X} $*"; }
+bad()  { echo "  ${R}✖${X} $*"; }
+die()  { echo "${R}notion-listen:${X} $*" >&2; exit 1; }
+
+usage() {
+  cat <<EOF
+${B}notion-listen${X} ${VERSION} - comment on a Notion page, and a Claude Code agent does it.
+
+${B}Usage${X}
+  notion-listen <page-url>           Listen to a page from the current folder
+                                     (open more terminals for more pages)
+  notion-listen setup                Set up, or change settings
+  notion-listen doctor [page-url]    Check that everything is ready
+  notion-listen stop                 Stop the background webhook services now
+  notion-listen update               Update to the latest version
+  notion-listen --version
+
+${B}Examples${X}
+  cd ~/my-project
+  notion-listen "https://www.notion.so/My-Page-1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d"
+
+Settings: $CONFIG_FILE
+Docs:     https://github.com/lanyado/notion-listen
+EOF
+  exit "${1:-0}"
+}
+
+# --- config -------------------------------------------------------------------
+# Older versions kept settings in <install>/.env. Move them once.
+migrate_legacy_config() {
+  [ -f "$CONFIG_FILE" ] || [ ! -f "$ROOT/.env" ] || {
+    mkdir -p "$CONFIG_DIR" && mv "$ROOT/.env" "$CONFIG_FILE" && chmod 600 "$CONFIG_FILE" \
+      && say "${D}moved your settings to $CONFIG_FILE${X}"
+  }
+}
+
+# Read KEY from config.env; a variable already set in the shell wins.
+env_get() {
+  local v="${!1:-}"
+  if [ -z "$v" ] && [ -f "$CONFIG_FILE" ]; then
+    v="$(grep -E "^[[:space:]]*$1[[:space:]]*=" "$CONFIG_FILE" | tail -1 | sed -E 's/^[^=]*=[[:space:]]*//; s/[[:space:]]+$//; s/^["'\'']//; s/["'\'']$//')"
+  fi
+  echo "$v"
+}
+
+check_install() {
+  command -v node >/dev/null || die "Node.js 20+ is required: https://nodejs.org"
+  [ -x "$TSX" ] || die "dependencies are missing. Run: (cd \"$ROOT\" && npm ci)"
+}
+
+check_ready() {
+  check_install
+  command -v claude >/dev/null || die "Claude Code is required: https://docs.claude.com/en/docs/claude-code"
+  command -v ngrok >/dev/null || die "ngrok is required: https://ngrok.com/download"
+  [ -n "$(env_get NOTION_TOKEN)" ] || die "not set up yet. Run: notion-listen setup"
+  [ -n "$(env_get NOTION_VERIFICATION_TOKEN)" ] \
+    || warn "the Notion webhook isn't verified yet, so comments won't arrive. Run: notion-listen setup" >&2
+}
+
+# --- Notion -------------------------------------------------------------------
+# Pull a 32-hex page id out of a Notion url or raw id. A peek view's ?p=<id>
+# wins; otherwise the id is the last 32 chars of the last path segment. Do not
+# just grep the whole string for 32 hex chars: a title ending in a-f
+# ("My-Page-<id>") glues onto the id once dashes are stripped.
+parse_page_id() {
+  if [[ "$1" =~ [?\&]p=([0-9a-fA-F]{32}) ]]; then echo "${BASH_REMATCH[1]}"; return; fi
+  local s="${1%%[?#]*}"
+  s="${s%/}"
+  s="${s##*/}"
+  s="$(echo "$s" | tr -d '-')"
+  echo "${s: -32}" | grep -ioE '^[0-9a-f]{32}$'
+}
+
+notion_status() { # $1 = API path; prints the HTTP status
+  curl -s -o /dev/null -w '%{http_code}' --max-time 15 "https://api.notion.com/v1$1" \
+    -H "Authorization: Bearer $(env_get NOTION_TOKEN)" -H 'Notion-Version: 2022-06-28'
+}
+
+# Fail early with a clear fix instead of a session that silently gets nothing.
+check_page_access() {
+  case "$(notion_status "/pages/$1")" in
+    200) ;;
+    404) die "your integration can't see this page. In Notion, open the page: ••• -> Connections -> add your integration." ;;
+    401) die "Notion rejected your token. Run: notion-listen setup" ;;
+    *) warn "could not check page access; continuing" >&2 ;;
+  esac
+}
+
+# --- processes ----------------------------------------------------------------
+migrate_legacy_config
+PORT="$(env_get NOTION_LISTEN_PORT)"; PORT="${PORT:-8788}"
+export NOTION_LISTEN_PORT="$PORT"
+
+# Match only the real processes. A bare `pgrep -f "ngrok http 8788"` also hits
+# any shell, editor or grep whose command line merely contains that text, so
+# "is ngrok up?" lies and cleanup kills unrelated processes.
+ngrok_pids() { pgrep -f "^([^ ]*/)?ngrok http $PORT( |\$)"; }
+router_pids() { pgrep -f "^[^ ]*node .*$ROOT/src/router\.ts"; }
+ngrok_running() { [ -n "$(ngrok_pids)" ]; }
+# Connecting also counts as activity, so a router about to idle out stays up.
+router_ping() {
+  node -e 'const s=require("net").connect(process.argv[1],()=>s.end());s.on("error",()=>process.exit(1))' \
+    "$STATE_DIR/router.sock" </dev/null >/dev/null 2>&1
+}
+# shellcheck disable=SC2086 # $p is a list of pids, split on purpose
+stop_ngrok() { local p; p="$(ngrok_pids)"; [ -n "$p" ] && kill $p 2>/dev/null; }
+# shellcheck disable=SC2086
+stop_router() { local p; p="$(router_pids)"; [ -n "$p" ] && kill $p 2>/dev/null; }
+
+# Newer ngrok calls it --url; older v3 agents only know --domain.
+ngrok_domain_flag() {
+  if ngrok http --help 2>&1 | grep -q -- '--url '; then echo --url; else echo --domain; fi
+}
+
+tunnel_url() {
+  curl -s --max-time 2 http://127.0.0.1:4040/api/tunnels | node -e '
+    let d="";process.stdin.on("data",c=>d+=c).on("end",()=>{try{
+      const t=JSON.parse(d).tunnels.find(x=>x.public_url.startsWith("https")&&String(x.config&&x.config.addr).endsWith(":"+process.argv[1]))
+      console.log(t?t.public_url:"")}catch{console.log("")}})' "$PORT"
+}
+
+# Ensure ngrok is up on $PORT (static domain if NGROK_DOMAIN is set). It runs
+# in its own session, so it outlives this terminal: the tunnel is shared by
+# every session, and the router stops it once the last one is gone.
+ensure_ngrok() {
+  local domain url err code log flag=""
+  log="$STATE_DIR/ngrok.log"
+  if ngrok_running; then
+    [ -n "$(tunnel_url)" ] && return 0
+    # The process is alive but its tunnel is gone (e.g. "heartbeat timeout"
+    # after sleep or a network change): Notion's webhooks go nowhere. Restart.
+    say "${D}ngrok is running but its tunnel is down; restarting it${X}"
+    stop_ngrok; sleep 1
+  fi
+  domain="$(env_get NGROK_DOMAIN)"
+  [ -n "$domain" ] && flag="$(ngrok_domain_flag)"
+  say "${D}starting ngrok on port $PORT${X}"
+  node "$ROOT/src/daemon.mjs" "$log" ngrok http "$PORT" ${domain:+"$flag" "$domain"} --log=stdout </dev/null \
+    || die "could not start ngrok"
+  for _ in $(seq 1 20); do
+    url="$(tunnel_url)"; [ -n "$url" ] && break
+    ngrok_running || break
+    sleep 0.5
+  done
+  if [ -z "$url" ]; then
+    stop_ngrok
+    # Surface ngrok's own reason, e.g. ERR_NGROK_108 (another ngrok session is
+    # already running, often on another machine) or a missing authtoken.
+    code="$(grep -oE 'ERR_NGROK_[0-9]+' "$log" | head -1)"
+    err="$(grep -E 'lvl=(eror|crit)' "$log" | grep -oE 'err="[^"\\]*' | head -1 | sed 's/^err="//')"
+    die "ngrok did not start${err:+: $err}${code:+ ($code, see https://ngrok.com/docs/errors/${code#ERR_NGROK_})}
+Full log: $log. First time using ngrok? Run: ngrok config add-authtoken <token>"
+  fi
+  say "${D}webhook URL: $url/notion-webhook${X}"
+  [ -n "$domain" ] || warn "no NGROK_DOMAIN is set, so this URL changes every run and the Notion webhook must be updated to match."
+}
+
+# --- session ------------------------------------------------------------------
+MCP_STATE=""
+HOLD_PID=""
+FOLDER="$(pwd -P)"
+# shellcheck disable=SC2329 # invoked by the EXIT trap
+cleanup() {
+  # Detach node from the terminal: if the window was just closed, node aborts
+  # at startup on the hung-up tty and the restore would silently not happen.
+  [ -n "$MCP_STATE" ] && node "$ROOT/src/mcp-servers.mjs" restore "$FOLDER" "$MCP_STATE" </dev/null >/dev/null 2>&1
+  [ -n "$HOLD_PID" ] && kill "$HOLD_PID" 2>/dev/null
+  return 0
+}
+trap cleanup EXIT
+# Closing the terminal window sends SIGHUP; bash skips the EXIT trap when a
+# signal kills it, so turn these signals into a normal exit.
+trap 'exit 129' HUP
+trap 'exit 143' TERM
+
+launch_claude() {
+  local pid="$1" server=notion-channel
+  node "$ROOT/src/mcp-servers.mjs" write-config "$FOLDER" "$server" "$TSX" "$ROOT/src/channel.ts" || exit 1
+  # A server switched off for this folder (an old "no" to Claude's "new MCP
+  # server found" prompt, or /mcp -> disable) makes the channel silently not
+  # start. Switch ours back on for this session; cleanup restores the choice.
+  MCP_STATE="$(mktemp "${TMPDIR:-/tmp}/notion-listen-mcp.XXXXXX")"
+  node "$ROOT/src/mcp-servers.mjs" enable "$FOLDER" "$MCP_STATE" "$server" notion
+  say "${G}●${X} ${B}listening${X} to page $pid from $(pwd)"
+  say "${D}  Comment on the page in Notion. Quit with /exit.${X}"
+  say "${D}  Claude Code asks to confirm the development channel: choose \"I am using this for local development\".${X}"
+  # --append-system-prompt makes the MODEL itself page-aware (env vars are not
+  # visible to the model, only to the process), so "the page" in a comment
+  # resolves without restating the id. Notion tools and file edits are
+  # auto-approved by claude-settings.json; Bash still asks. Each worker reads
+  # prompts/worker.md from the install, outside the project folder, so
+  # allow reading exactly that file; otherwise every comment stalls on a prompt.
+  # (Not --add-dir: that would also let the agent edit its own rules.)
+  claude --dangerously-load-development-channels "server:$server" \
+    --settings "$(user_or_bundled config/claude-settings.json)" \
+    --allowedTools "Read(/$(user_or_bundled prompts/worker.md))" \
+    --append-system-prompt "Bound Notion page id: $pid . When a comment says 'the page' / 'this page' / 'הדף' it means this page. The notion MCP tools (notion-fetch, notion-update-page) act on it; the channel is bound to it. The user reads Notion, not this terminal: when a background worker finishes, say nothing unless it failed, and never summarize dispatches or finished work here."
+}
+
+# One router per machine owns the port and routes each event to the session
+# bound to its page, so any number of sessions can come and go.
+listen() {
+  local pid="$1" holder
+  if ! router_ping; then
+    stop_router # a leftover that no longer answers
+    holder="$(lsof -ti :"$PORT" -sTCP:LISTEN 2>/dev/null | head -1)"
+    [ -z "$holder" ] || die "port $PORT is in use by another program (pid $holder). Stop it, or set NOTION_LISTEN_PORT in $CONFIG_FILE"
+    say "${D}starting the webhook router${X}"
+    # Detached, so it outlives this terminal. It writes router.log itself; raw
+    # output (crashes) goes to router.out.log.
+    node "$ROOT/src/daemon.mjs" "$STATE_DIR/router.out.log" "$TSX" "$ROOT/src/router.ts" </dev/null \
+      || die "could not start the router"
+    for _ in $(seq 1 20); do router_ping && break; sleep 0.5; done
+    router_ping || die "the router failed to start; see $STATE_DIR/router.out.log"
+  fi
+  node "$ROOT/src/hold.mjs" "$STATE_DIR/router.sock" "$$" </dev/null >/dev/null 2>&1 &
+  HOLD_PID=$!
+  ensure_ngrok
+  launch_claude "$pid"
+}
+
+# --- doctor -------------------------------------------------------------------
+doctor() {
+  local page="${1:-}" problems=0 v name code
+  fail() { bad "$*"; problems=$((problems + 1)); }
+  say "${B}notion-listen doctor${X} ${D}($VERSION, $ROOT)${X}"
+
+  echo; say "${B}Tools${X}"
+  if command -v node >/dev/null; then
+    v="$(node -p 'process.versions.node')"
+    [ "${v%%.*}" -ge 20 ] && ok "Node.js $v" || fail "Node.js $v is too old; version 20 or newer is required"
+  else fail "Node.js is not installed: https://nodejs.org"; fi
+  [ -x "$TSX" ] && ok "dependencies installed" || fail "dependencies missing. Run: (cd \"$ROOT\" && npm ci)"
+  if command -v claude >/dev/null; then ok "Claude Code $(claude --version 2>/dev/null | head -1)"
+  else fail "Claude Code is not installed: https://docs.claude.com/en/docs/claude-code"; fi
+  if command -v ngrok >/dev/null; then
+    if [ -n "${NGROK_AUTHTOKEN:-}" ] || { ngrok config check >/dev/null 2>&1 && grep -qs 'authtoken' "$(ngrok config check 2>/dev/null | sed -n 's/^Valid configuration file at //p')"; }; then
+      ok "ngrok $(ngrok version | awk '{print $3}'), signed in"
+    else fail "ngrok has no authtoken. Run: ngrok config add-authtoken <token>"; fi
+  else fail "ngrok is not installed: https://ngrok.com/download"; fi
+
+  echo; say "${B}Settings${X} ${D}($CONFIG_FILE)${X}"
+  if [ -z "$(env_get NOTION_TOKEN)" ]; then
+    fail "no Notion token. Run: notion-listen setup"
+  else
+    code="$(notion_status /users/me)"
+    case "$code" in
+      200) ok "Notion token works" ;;
+      401) fail "Notion rejected the token. Run: notion-listen setup" ;;
+      *) warn "could not reach Notion (HTTP $code)" ;;
+    esac
+  fi
+  [ -n "$(env_get NOTION_VERIFICATION_TOKEN)" ] && ok "webhook verified" \
+    || fail "webhook not verified, so comments won't arrive. Run: notion-listen setup"
+  [ -n "$(env_get NOTION_ALLOWED_AUTHORS)" ] && ok "only allowed people can instruct the agent" \
+    || warn "anyone who can comment on a page can instruct the agent (set allowed people with: notion-listen setup)"
+  [ -n "$(env_get NGROK_DOMAIN)" ] && ok "static ngrok domain $(env_get NGROK_DOMAIN)" \
+    || warn "no static ngrok domain, so the webhook URL changes every run"
+
+  echo; say "${B}Runtime${X}"
+  if lsof -ti :"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+    name="$(ps -p "$(lsof -ti :"$PORT" -sTCP:LISTEN | head -1)" -o command= | grep -oE 'src/router\.ts' | head -1)"
+    case "$name" in
+      src/router.ts) ok "port $PORT: webhook router running" ;;
+      *) fail "port $PORT is used by another program. Stop it, or set NOTION_LISTEN_PORT" ;;
+    esac
+  else ok "port $PORT is free"; fi
+  if ngrok_running; then
+    [ -n "$(tunnel_url)" ] && ok "ngrok tunnel up: $(tunnel_url)" || warn "ngrok is running but its tunnel is down (it will be restarted on the next start)"
+  fi
+  if [ -n "$page" ]; then
+    v="$(parse_page_id "$page")"
+    if [ -z "$v" ]; then fail "no page id in: $page"
+    else
+      case "$(notion_status "/pages/$v")" in
+        200) ok "your integration can see page $v" ;;
+        404) fail "your integration can't see page $v. In Notion: ••• -> Connections -> add your integration" ;;
+        *) warn "could not check page $v" ;;
+      esac
+    fi
+  fi
+
+  if [ "$(basename "${SHELL:-}")" = zsh ] && [ -f "$HOME/.zshrc" ]; then
+    echo; say "${B}Shell${X}"
+    if grep -qE '^[[:space:]]*(function[[:space:]]+)?notion-listen[[:space:]]*\(\)' "$HOME/.zshrc"; then
+      fail "an old notion-listen function in ~/.zshrc hides this command; delete it"
+    fi
+    grep -q "noglob notion-listen" "$HOME/.zshrc" && ok "links with ? work unquoted (noglob alias)" \
+      || warn "zsh needs quotes around links that contain ? (or run notion-listen setup to add an alias)"
+  fi
+
+  echo
+  if [ "$problems" = 0 ]; then say "${G}${B}All set.${X} Run: notion-listen <page-url>"; return 0
+  elif [ "$problems" = 1 ]; then say "${R}${B}1 problem found.${X} Fix the ✖ item above."; return 1
+  else say "${R}${B}$problems problems found.${X} Fix the ✖ items above."; return 1; fi
+}
+
+# --- update -------------------------------------------------------------------
+update() {
+  [ -d "$ROOT/.git" ] || die "this copy wasn't installed with git; reinstall with the installer from https://github.com/lanyado/notion-listen"
+  local before after
+  before="$VERSION"
+  git -C "$ROOT" pull --ff-only --quiet || die "could not update (local changes in $ROOT?)"
+  # A development clone keeps its dev dependencies (typescript); installs don't need them.
+  local omit="--omit=dev"
+  [ -d "$ROOT/node_modules/typescript" ] && omit=""
+  (cd "$ROOT" && npm ci $omit --no-audit --no-fund --no-update-notifier --loglevel=error >/dev/null) || die "npm ci failed in $ROOT"
+  after="$(sed -n 's/^  "version": "\(.*\)",$/\1/p' "$ROOT/package.json")"
+  [ "$before" = "$after" ] && say "${G}✔${X} already up to date ($after)" || say "${G}✔${X} updated $before -> $after"
+}
+
+# Everything runs from main, and the script exits right after it: bash reads a
+# script as it runs, so editing this file (or git pull) while a session is open
+# would otherwise make that session execute shifted lines when it exits.
+main() {
+  mkdir -p "$STATE_DIR"
+  case "${1:-}" in
+    ""|-h|--help|help) usage ;;
+    -v|--version|version) echo "notion-listen $VERSION"; exit 0 ;;
+    setup) check_install; exec "$TSX" "$ROOT/src/setup.ts" ;;
+    doctor) doctor "${2:-}"; exit $? ;;
+    update) update; exit $? ;;
+    stop)
+      stop_router && echo "stopped the webhook router"
+      stop_ngrok && echo "stopped ngrok"
+      exit 0 ;;
+  esac
+
+  local page="" arg pid
+  for arg in "$@"; do
+    case "$arg" in
+      -*) usage 1 >&2 ;;
+      *) [ -z "$page" ] || usage 1 >&2; page="$arg" ;;
+    esac
+  done
+
+  pid="$(parse_page_id "$page")"
+  [ -n "$pid" ] || die "couldn't find a Notion page id in: $page
+Pass the page link (Share -> Copy link) or its 32-character id."
+  check_ready
+  export NOTION_PAGE_ID="$pid"
+  check_page_access "$pid"
+
+  listen "$pid"
+}
+
+main "$@"
+exit $?

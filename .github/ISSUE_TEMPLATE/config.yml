@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Troubleshooting guide
+    url: https://github.com/lanyado/notion-listen/blob/main/docs/troubleshooting.md
+    about: Most setup problems are covered here. Try `notion-listen doctor` first.
+  - name: Report a vulnerability
+    url: https://github.com/lanyado/notion-listen/security/advisories/new
+    about: Please report security problems privately.
