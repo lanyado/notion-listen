@@ -13,14 +13,9 @@
 
 **[Quick start](#quick-start)** · [How it works](docs/how-it-works.md) · [Configuration](docs/configuration.md) · [FAQ](docs/faq.md) · [Troubleshooting](docs/troubleshooting.md)
 
-<br>
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/demo-dark.svg">
-  <img alt="Demo on a Notion-like page: you ask which item in a list is the riskiest. The comment gets eyes, then thinking-face reactions while the agent reads your project notes, the answer appears in the thread, then a check mark. You follow up: turn the list into a table. Only the format changes, then a check mark." src="assets/demo-light.svg">
-</picture>
-
 </div>
+
+https://github.com/user-attachments/assets/9c42d98f-5c06-43f4-87f6-3d87da114a50
 
 Highlight text in Notion and comment. A Claude Code agent **on your machine,
 inside your project** does the work and answers in the thread. You never leave
