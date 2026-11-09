@@ -46,12 +46,15 @@ node_major="$(node -p 'process.versions.node.split(".")[0]')"
 ok "Node.js $(node -v)"
 command -v npm >/dev/null || die "npm is required (it comes with Node.js)"
 missing=0
-if command -v claude >/dev/null; then ok "Claude Code"
+# Claude Code's own installer puts claude in ~/.local/bin, which a fresh shell
+# may not have on PATH yet.
+have() { command -v "$1" >/dev/null || [ -x "$BIN_DIR/$1" ] || [ -x "$HOME/.local/bin/$1" ]; }
+if have claude; then ok "Claude Code"
 else warn "Claude Code is not installed yet: https://docs.claude.com/en/docs/claude-code"; missing=1; fi
-if command -v ngrok >/dev/null; then ok "ngrok"
+if have ngrok; then ok "ngrok"
 else warn "ngrok is not installed yet: https://ngrok.com/download (or: brew install ngrok)"; missing=1; fi
 command -v curl >/dev/null || die "curl is required"
-command -v lsof >/dev/null || die "lsof is required (Debian/Ubuntu: sudo apt install lsof; Fedora: sudo dnf install lsof)"
+command -v lsof >/dev/null || die "lsof is required (Debian/Ubuntu: sudo apt-get update && sudo apt-get install -y lsof; Fedora: sudo dnf install lsof)"
 
 step "Installing into $HOME_DIR"
 if [ -d "$HOME_DIR/.git" ]; then

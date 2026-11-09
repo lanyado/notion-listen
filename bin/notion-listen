@@ -270,12 +270,23 @@ doctor() {
     [ "${v%%.*}" -ge 20 ] && ok "Node.js $v" || fail "Node.js $v is too old; version 20 or newer is required"
   else fail "Node.js is not installed: https://nodejs.org"; fi
   [ -x "$TSX" ] && ok "dependencies installed" || fail "dependencies missing. Run: (cd \"$ROOT\" && npm ci)"
-  if command -v claude >/dev/null; then ok "Claude Code $(claude --version 2>/dev/null | head -1)"
+  if command -v claude >/dev/null; then
+    name="Claude Code $(claude --version 2>/dev/null | head -1)"
+    # Channels need an Anthropic login (claude.ai or Console API key). Older
+    # Claude Code has no `auth` command, so skip the check there.
+    if claude --help 2>/dev/null | grep -qE '^ +auth +'; then
+      v="$(claude auth status </dev/null 2>/dev/null)"
+      if ! grep -qE '"loggedIn": *true' <<<"$v"; then
+        fail "$name is not signed in. Run claude, then type /login"
+      elif ! grep -qE '"apiProvider": *"firstParty"' <<<"$v"; then
+        fail "$name runs through $(sed -nE 's/.*"apiProvider": *"([^"]*)".*/\1/p' <<<"$v"), but channels need a claude.ai login or Console API key"
+      else ok "$name, signed in"; fi
+    else ok "$name"; fi
   else fail "Claude Code is not installed: https://docs.claude.com/en/docs/claude-code"; fi
   if command -v ngrok >/dev/null; then
     if [ -n "${NGROK_AUTHTOKEN:-}" ] || { ngrok config check >/dev/null 2>&1 && grep -qs 'authtoken' "$(ngrok config check 2>/dev/null | sed -n 's/^Valid configuration file at //p')"; }; then
       ok "ngrok $(ngrok version | awk '{print $3}'), signed in"
-    else fail "ngrok has no authtoken. Run: ngrok config add-authtoken <token>"; fi
+    else fail "ngrok is not signed in. Run: notion-listen setup"; fi
   else fail "ngrok is not installed: https://ngrok.com/download"; fi
 
   echo; say "${B}Settings${X} ${D}($CONFIG_FILE)${X}"

@@ -17,6 +17,15 @@ mkdir -p "$T/install" "$T/home" "$T/stubs" "$T/project"
 cp -R "$REPO/bin" "$REPO/src" "$REPO/config" "$REPO/prompts" "$REPO/package.json" "$T/install/"
 ln -s "$REPO/node_modules" "$T/install/node_modules"
 for tool in claude ngrok; do printf '#!/bin/sh\necho "%s stub"\n' "$tool" > "$T/stubs/$tool"; chmod +x "$T/stubs/$tool"; done
+# With STUB_AUTH set, the claude stub has an `auth` command that prints it.
+cat > "$T/stubs/claude" <<'EOF'
+#!/bin/sh
+case "$*" in
+  --help) [ -n "${STUB_AUTH:-}" ] && echo "  auth    Manage authentication" ;;
+  "auth status") echo "$STUB_AUTH"; case "$STUB_AUTH" in *'"loggedIn": true'*) exit 0 ;; esac; exit 1 ;;
+  *) echo "claude stub" ;;
+esac
+EOF
 export HOME="$T/home" PATH="$T/stubs:$PATH" NO_COLOR=1 SHELL=/bin/bash
 export NOTION_LISTEN_CONFIG_DIR="$T/home/config" NOTION_LISTEN_STATE_DIR="$T/home/state"
 unset NOTION_TOKEN NOTION_VERIFICATION_TOKEN NOTION_ALLOWED_AUTHORS NGROK_DOMAIN NOTION_LISTEN_PORT
@@ -35,6 +44,14 @@ check "not set up exit code" "1" "$code"
 out="$("$CLI" doctor 2>&1)"; code=$?
 check "doctor finds the missing token" "no Notion token" "$out"
 check "doctor exit code" "1" "$code"
+check "doctor skips sign-in on old claude" "✔ Claude Code claude stub" "$out"
+check "doctor never asks to paste an ngrok token" "ngrok is not signed in. Run: notion-listen setup" "$out"
+check "doctor: signed out" "is not signed in. Run claude, then type /login" \
+  "$(STUB_AUTH='{"loggedIn": false, "apiProvider": "firstParty"}' "$CLI" doctor 2>&1)"
+check "doctor: bedrock" "runs through bedrock, but channels need" \
+  "$(STUB_AUTH='{"loggedIn": true, "apiProvider": "bedrock"}' "$CLI" doctor 2>&1)"
+check "doctor: signed in" "claude stub, signed in" \
+  "$(STUB_AUTH='{"loggedIn": true, "apiProvider": "firstParty"}' "$CLI" doctor 2>&1)"
 
 # Old installs kept settings in <install>/.env; the CLI moves them once.
 printf 'NOTION_TOKEN=secret_x\n' > "$T/install/.env"
