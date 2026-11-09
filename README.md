@@ -49,6 +49,8 @@ You need [Node.js 20+](https://nodejs.org), [Claude Code](https://docs.claude.co
 curl -fsSL https://raw.githubusercontent.com/lanyado/notion-listen/main/install.sh | bash
 ```
 
+Using an AI agent? Point it at [INSTALL.md](INSTALL.md).
+
 The installer runs a five-minute setup wizard. Then share a page with your
 integration (**••• → Connections**) and start listening from your project:
 
